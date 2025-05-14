@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Scribely clinical documentation assistant'
+
+Parameters:
+  Environment:
+    Description: Environment (dev, staging, prod)
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+  
+  VpcId:
+    Description: VPC ID for the ECS cluster
+    Type: AWS::EC2::VPC::Id
+  
+  SubnetIds:
+    Description: List of subnet IDs for the ECS cluster
+    Type: List<AWS::EC2::Subnet::Id>
+  
+  ContainerPort:
+    Description: Port on which the containers are listening
+    Type: Number
+    Default: 8000
+  
+  DesiredCount:
+    Description: Desired count of containers
+    Type: Number
+    Default: 2
+  
+  MaxCount:
+    Description: Maximum count of containers
+    Type: Number
+    Default: 4
+  
+  SecretKey:
+    Description: Secret key for JWT tokens
+    Type: String
+    NoEcho: true
+  
+  HuggingFaceApiToken:
+    Description: HuggingFace API token
+    Type: String
+    NoEcho: true
+
+Resources:
+  # ECR Repositories
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub scribely-backend-${Environment}
+
+  FrontendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub scribely-frontend-${Environment}
+
+  # MongoDB DocumentDB
+  DBCluster:
+    Type: AWS::DocDB::DBCluster
+    Properties:
+      MasterUsername: scribely
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${MongoDBSecret}:SecretString:password}}'
+      DBClusterIdentifier: !Sub scribely-${Environment}
+      StorageEncrypted: true
+      EngineVersion: "4.0.0"
+      DeletionProtection: false
+
+  DBInstance:
+    Type: AWS::DocDB::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceIdentifier: !Sub scribely-${Environment}-instance
+      DBInstanceClass: db.r5.large
+      AutoMinorVersionUpgrade: true
+
+  MongoDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub scribely-${Environment}-mongodb
+      Description: MongoDB credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "scribely"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub scribely-${Environment}
+
+  # IAM Roles
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+        - 'arn:aws:iam::aws:policy/AmazonTranscribeFullAccess'
+
+  # Security Groups
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Scribely ECS service
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp: 0.0.0.0/0
+
+  # Load Balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !GetAtt ECSSecurityGroup.GroupId
+      Scheme: internet-facing
+      Type: application
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+
+  # ECS Task Definition
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub scribely-backend-${Environment}
+      Cpu: 512
+      Memory: 1024
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendRepository}:latest
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              HostPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: MONGODB_URL
+              Value: !Sub 'mongodb://${DBCluster.Endpoint}:27017'
+            - Name: DATABASE_NAME
+              Value: scribely
+            - Name: SECRET_KEY
+              Value: !Ref SecretKey
+            - Name: FRONTEND_URL
+              Value: !Sub http://${LoadBalancer.DNSName}
+            - Name: HUGGINGFACE_API_TOKEN
+              Value: !Ref HuggingFaceApiToken
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: scribely
+
+  # ECS Service
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn: HTTPListener
+    Properties:
+      ServiceName: !Sub scribely-backend-${Environment}
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !GetAtt ECSSecurityGroup.GroupId
+          Subnets: !Ref SubnetIds
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+  # CloudWatch Logs
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/scribely-${Environment}
+      RetentionInDays: 30
+
+  # Auto Scaling
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCount
+      MinCapacity: !Ref DesiredCount
+      ResourceId: !Sub service/${ECSCluster}/${BackendService.Name}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub scribely-${Environment}-scaling-policy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70.0
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name of the load balancer
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub ${AWS::StackName}-LoadBalancerDNS
+
+  MongoDBEndpoint:
+    Description: MongoDB endpoint
+    Value: !GetAtt DBCluster.Endpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-MongoDBEndpoint
+
+  BackendRepository:
+    Description: ECR Repository for backend
+    Value: !GetAtt BackendRepository.RepositoryUri
+    Export:
+      Name: !Sub ${AWS::StackName}-BackendRepository
+
+  FrontendRepository:
+    Description: ECR Repository for frontend
+    Value: !GetAtt FrontendRepository.RepositoryUri
+    Export:
+      Name: !Sub ${AWS::StackName}-FrontendRepository 

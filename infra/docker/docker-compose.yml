@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:4.4
+    container_name: scribely-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - scribely-network
+
+  backend:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.backend
+    container_name: scribely-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_URL=mongodb://mongodb:27017
+      - DATABASE_NAME=scribely
+      - SECRET_KEY=${SECRET_KEY:-CHANGE_THIS_TO_A_RANDOM_SECRET}
+      - FRONTEND_URL=http://localhost
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - HUGGINGFACE_API_TOKEN=${HUGGINGFACE_API_TOKEN}
+    depends_on:
+      - mongodb
+    networks:
+      - scribely-network
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.frontend
+    container_name: scribely-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - scribely-network
+
+networks:
+  scribely-network:
+    driver: bridge
+
+volumes:
+  mongodb_data: 
